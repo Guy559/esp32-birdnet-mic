@@ -81,6 +81,7 @@ extern bool streamEnabled[2];
 extern uint8_t maxActiveClients;
 struct StreamStats { uint8_t clientCount; bool streaming; uint32_t packetsSent; unsigned long statsResetMs; unsigned long lastConnectMs; unsigned long lastPlayMs; };
 extern StreamStats streamStats[2];
+extern uint32_t getCurrentPacketRate(uint8_t profileIndex);
 extern void getStreamClientCounts(uint8_t &s1, uint8_t &s2);
 extern String getRtspClientSummary();
 extern void stopAllRtspClients(const char* reason);
@@ -840,10 +841,7 @@ static void httpStatus() {
     String utcTimeStr = formatUtcDateTimeSafe();
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
-    unsigned long runtime = millis() - lastStatsReset;
-    uint32_t currentRate = (isStreaming && runtime > 1000)
-        ? (uint32_t)(((uint64_t)audioPacketsSent * 1000ULL) / runtime)
-        : 0;
+    uint32_t currentRate = getCurrentPacketRate(255);
     String json = "{";
     json.reserve(1800);
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
@@ -867,14 +865,13 @@ static void httpStatus() {
     // Per-stream client counts
     uint8_t s1clients = 0, s2clients = 0;
     getStreamClientCounts(s1clients, s2clients);
-    unsigned long nowMs = millis();
     json += "\"s1_clients\":" + String(s1clients) + ",";
     json += "\"s1_streaming\":" + String(streamStats[0].streaming?"true":"false") + ",";
-    json += "\"s1_pkt_rate\":" + String((streamStats[0].streaming && (nowMs - streamStats[0].statsResetMs) > 1000) ? (uint32_t)(((uint64_t)streamStats[0].packetsSent * 1000ULL) / (nowMs - streamStats[0].statsResetMs)) : 0) + ",";
+    json += "\"s1_pkt_rate\":" + String(getCurrentPacketRate(0)) + ",";
     json += "\"s1_last_play\":\"" + jsonEscape(formatSince(streamStats[0].lastPlayMs)) + "\",";
     json += "\"s2_clients\":" + String(s2clients) + ",";
     json += "\"s2_streaming\":" + String(streamStats[1].streaming?"true":"false") + ",";
-    json += "\"s2_pkt_rate\":" + String((streamStats[1].streaming && (nowMs - streamStats[1].statsResetMs) > 1000) ? (uint32_t)(((uint64_t)streamStats[1].packetsSent * 1000ULL) / (nowMs - streamStats[1].statsResetMs)) : 0) + ",";
+    json += "\"s2_pkt_rate\":" + String(getCurrentPacketRate(1)) + ",";
     json += "\"s2_last_play\":\"" + jsonEscape(formatSince(streamStats[1].lastPlayMs)) + "\",";
     json += "\"mdns_hostname\":\"" + jsonEscape(mdnsHostname) + "\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";

@@ -8,7 +8,7 @@ Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit P
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.25** (2026-10-04; persistent Wi-Fi access-point selection)
+- Latest public firmware: **v1.26** (2026-10-11; improved audio buffering and responsive streaming)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
 - Recommended microphone: **Adafruit SPH0645LM4H** in selectable MSB / left-justified mode
@@ -46,7 +46,7 @@ remains available only as a compatibility alias for stream 1.
 
 ## Access point selection
 
-In **Time & Network → Access point**, leave **Automatic selection** enabled for the usual
+In **Time & Network → Access point**, leave **Default connection** enabled for the usual
 Wi-Fi behavior, or choose **Choose a specific access point**. Click **Find access points**, select
 one of the access points for your saved Wi-Fi network, then **Save and connect**. Results are
 ordered by signal strength (for example, -58 dBm is stronger than -75 dBm). The current connection
@@ -56,7 +56,7 @@ selection disconnects existing streams while Wi-Fi reconnects.
 The selected BSSID is saved across reconnects, restarts and OTA updates. The device does not
 fall back to another access point while locked. If the selected AP is unavailable for one minute,
 the device starts **ESP32-RTSP-Mic-AP**. Join that recovery Wi-Fi and open **http://192.168.4.1**
-to select **Automatic selection** or another AP. Recovery Wi-Fi closes after the device reconnects.
+to select **Default connection** or another AP. Recovery Wi-Fi closes after the device reconnects.
 This is a local recovery network without a Wi-Fi password, like the initial setup network.
 Reset Wi-Fi and factory reset also clear the saved AP selection.
 
@@ -74,6 +74,16 @@ POST requests require the existing `X-ESP32MIC-CSRF: 1` header. Saving reconnect
 5. After reboot, open `http://<device-ip>/`.
 
 Default hostname is unique per device, for example `esp32mic-a1b2c3`.
+
+## What's New In v1.26
+
+- More efficient RTSP/TCP sending keeps the Web UI and other connected clients responsive.
+- Improved handling of queued audio and a 64 KiB internal reserve for packet sizes up to 2048 samples.
+- Microphone auto-recovery follows capture activity, with a cooldown between recovery attempts.
+- Packet rates in the Web UI, API and MQTT reflect the most recent ten seconds.
+- MQTT updates are coalesced and sent after audio processing, with bounded socket writes.
+- Arduino ESP32 core updated to 3.3.12; WiFiManager debug output disabled for quieter logs and a smaller image.
+- The default access-point option is now named **Default connection**; connection behavior is unchanged.
 
 ## What's New In v1.22
 
@@ -294,7 +304,7 @@ The Web UI runs on port **80** and includes:
 - Audio API diagnostics: producer state, ring-buffer capacity/chunks/drops/flushes, I2S errors,
   and RTSP write stalls/timeouts.
 - Time & Network: NTP state, microphone location/time zone, mDNS, stream schedule, optional deep sleep, Wi-Fi actions.
-- Reliability: auto-recovery, threshold mode, check interval, scheduled reset.
+- Reliability: microphone auto-recovery, output-rate warning threshold, performance check interval, scheduled reset. A slow network does not restart a healthy microphone; automatic recovery requires stopped capture reads and has a cooldown. Packet rates use a recent ten-second window and count frames handed to transport, not confirmed receiver delivery.
 - Thermal: current/peak temperature, shutdown limit, protection latch, acknowledgement.
 - MQTT & Home Assistant: broker settings, publish interval, discovery republish.
 - Firmware update: open `/ota` or click **Firmware update** in the Web UI.
@@ -474,7 +484,8 @@ MQTT settings are available in the Web UI and API.
 - RTSP server command: `<topic_prefix>/cmd/rtsp_server` with `ON` or `OFF`
 - Reboot command: `<topic_prefix>/cmd/reboot` with `PRESS` or `REBOOT`
 - Publish interval: default 60 s, range 10-3600 s
-- Immediate publishes happen on important events such as stream start/stop and connection changes.
+- Important events such as stream start/stop and connection changes request an immediate update;
+  requests are coalesced and published after audio processing in the main loop.
 
 Home Assistant MQTT Discovery creates entities for runtime values such as RSSI, uptime, heap,
 temperature, stream state, packet rate, client count, reboot reason, restart counter, firmware
@@ -553,9 +564,9 @@ strSchedEn       Stream schedule enable
 strSchStart      Stream window start minute
 strSchStop       Stream window stop minute
 deepSchSlp       Deep sleep outside schedule window
-autoRecovery     Packet-rate recovery enable
+autoRecovery     Stopped audio-capture recovery enable
 thrAuto          Automatic threshold mode
-minRate          Manual minimum packet rate
+minRate          Manual minimum recent output rate for a warning
 checkInterval    Recovery check interval in minutes
 schedReset       Scheduled reset enable
 resetHours       Scheduled reset interval
@@ -601,7 +612,7 @@ Current validation ranges include `sampleRate=8000..192000`, `bufferSize=256..81
 - No TLS or built-in user authentication for the Web UI/API.
 - mDNS depends on multicast support in your LAN and often does not work across VLANs, guest networks, or Docker bridge networks.
 - The firmware is primarily runtime-tested on Seeed Studio XIAO ESP32-C6 with ICS-43434; C3/S3/C5
-  builds are compile-verified in Arduino ESP32 core 3.3.8. SPH0645 support was tested on contributor
+  local v1.26 test builds are compile-verified in Arduino ESP32 core 3.3.12. SPH0645 support was tested on contributor
   hardware.
 
 ## Credits

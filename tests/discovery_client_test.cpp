@@ -7,13 +7,13 @@ int main() {
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     DiscoveryClient client;
     client.socket = pair[0];
-    client.discoveryWrite = true;
     uint8_t data[] = {1, 2, 3};
     assert(client.write(data, sizeof(data)) == sizeof(data));
     uint8_t received[3];
     assert(recv(pair[1], received, sizeof(received), 0) == 3);
     assert(received[0] == 1 && received[2] == 3);
-    // A receiver that never drains its socket cannot block discovery indefinitely.
+    // Ordinary writes have the same deadline as discovery. A receiver that
+    // never drains its socket cannot block telemetry/control indefinitely.
     int capacity = 1024;
     assert(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)) == 0);
     std::vector<uint8_t> large(1024 * 1024, 42);

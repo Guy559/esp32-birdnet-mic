@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.26 - 2026-10-11
+
+- Streaming: more efficient RTSP/TCP sending keeps the Web UI and other connected clients responsive.
+- Audio: improved handling of queued samples and a larger 64 KiB internal reserve for packet sizes up to 2048 samples, while retaining the existing RTP packet sizes.
+- Recovery: microphone auto-recovery follows capture activity, with a cooldown between recovery attempts.
+- Status: packet rates in the Web UI, API and MQTT reflect the most recent ten seconds.
+- MQTT: bounded socket writes and coalesced state updates prioritize audio processing.
+- Build: update the Arduino ESP32 core from 3.3.8 to 3.3.12.
+- Logs: disable WiFiManager debug output for quieter logs and a smaller firmware image.
+- Web UI: rename the default access-point option to "Default connection" for clearer wording; connection behavior is unchanged.
+
 ## 1.25 - 2026-10-04
 - Wi-Fi: optional persistent access-point selection, with on-demand same-network scanning and signal ordering in Time & Network. Automatic selection remains the default.
 - Connection recovery: keep the selected BSSID across reconnects and reboots; expose the local settings UI on ESP32-RTSP-Mic-AP after one minute offline so the selection can be changed without USB. Wi-Fi reset and factory reset clear the selection.

@@ -3,7 +3,8 @@
 Static page for flashing the birdnet-esp32-rtsp-mic firmware (BirdNET-Go / BirdNET-Pi, Seeed XIAO
 ESP32-C3/S3/C5/C6) directly from the browser with ESP Web Tools.
 
-Current images: **firmware 1.25** (2026-10-04; persistent Wi-Fi access-point selection).
+Current firmware: **1.26** (2026-10-11), with improved audio buffering, responsive RTSP/TCP sending,
+capture-based microphone recovery, recent packet-rate readings, and Arduino ESP32 core 3.3.12.
 
 For new builds, the recommended microphone is **Adafruit SPH0645LM4H** with the selectable
 MSB/left-justified format. Legacy ICS-43434/INMP441 microphones remain supported in the default

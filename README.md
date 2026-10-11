@@ -7,7 +7,7 @@
 Seeed XIAO ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS
 microphone and serves mono **16-bit PCM/L16** audio over **RTSP**.
 
-- Latest firmware: **v1.25** (2026-10-04; persistent Wi-Fi access-point selection)
+- Latest public firmware: **v1.26** (2026-10-11; improved audio buffering and responsive streaming)
 - Target sketch: `esp32-birdnet-mic`
 - Web flasher: **https://esp32mic.msmeteo.cz** (Chrome/Edge desktop, USB-C data cable)
 - Manual OTA firmware: `manual-ota-firmware/firmware-app-<board>.bin` (`firmware-app.bin` remains the C6 alias)
@@ -223,7 +223,7 @@ The firmware includes a configurable high-pass filter to reduce low-frequency ru
 ## Arduino IDE Build Size
 
 Firmware v1.9.2 and later includes `esp32-birdnet-mic/build_opt.h`, which the ESP32 Arduino core loads
-automatically in Arduino IDE and `arduino-cli`. It disables unused C++ exception/unwind metadata and
+automatically in Arduino IDE and `arduino-cli`. It disables WiFiManager serial debug output and unused C++ exception/unwind metadata, and
 keeps the tight XIAO ESP32-C3/C6 default 1.2 MB app partitions below the limit without removing
 firmware features.
 

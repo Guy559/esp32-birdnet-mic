@@ -23,9 +23,11 @@
 #include "TimeZoneSchedule.h"
 #include "DiscoveryProgress.h"
 #include "DiscoveryClient.h"
+#include "CooperativeTcpWriter.h"
+#include "StreamHealth.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.25"
+#define FW_VERSION "1.26"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -172,11 +174,22 @@ struct ClientSession {
     unsigned long playStartedAtMs = 0;
     unsigned long lastRtpPacketMs = 0;
     char userAgent[64] = {0};
-    uint8_t parseBuffer[1024];
+    uint8_t parseBuffer[1024] = {0};
     int parseBufferPos = 0;
+    uint16_t interleavedBytesRemaining = 0;
     unsigned long packetsSent = 0;
+    CooperativeTcpWriter tcpWriter;
+    bool tcpFrameIsRtp = false;
+    uint16_t tcpFrameSamples = 0;
+    uint32_t tcpFrameChunk = 0;
+    uint32_t tcpFrameDropsAtQueue = 0;
 
     void reset() {
+        tcpWriter.release();
+        tcpFrameIsRtp = false;
+        tcpFrameSamples = 0;
+        tcpFrameChunk = 0;
+        tcpFrameDropsAtQueue = 0;
         client.stop();
         if (transport == TRANSPORT_UDP) {
             udpSocket.stop();
@@ -196,6 +209,8 @@ struct ClientSession {
         lastRtpPacketMs = 0;
         userAgent[0] = '\0';
         parseBufferPos = 0;
+        interleavedBytesRemaining = 0;
+        parseBuffer[0] = '\0';
         packetsSent = 0;
     }
 };
@@ -221,6 +236,11 @@ struct StreamStats {
     unsigned long lastPlayMs = 0;
 };
 StreamStats streamStats[2];
+static uint32_t audioChunkSequence = 0;
+static uint32_t countedAudioChunk = 0;
+static uint32_t countedProfileChunk[2] = {0, 0};
+RecentPacketRate recentAudioRate;
+RecentPacketRate recentStreamRate[2];
 
 void stopAllRtspClients(const char* reason);
 void stopRtspClientsForStream(uint8_t profileIndex, const char* reason);
@@ -246,6 +266,7 @@ RingbufHandle_t audioRingBuffer = nullptr;
 TaskHandle_t audioProducerTaskHandle = nullptr;
 volatile bool audioProducerStopRequested = false;
 volatile bool audioProducerRunning = false;
+volatile uint32_t audioProducerLastReadMs = 0;
 size_t audioRingBufferCapacityBytes = 0;
 
 // -- Global state
@@ -309,6 +330,7 @@ bool wifiReconnectHasBssid = false;
 uint8_t wifiReconnectBssid[6] = {0};
 unsigned long bootTime = 0;
 unsigned long lastI2SReset = 0;
+unsigned long lastProducerHealthCheck = 0;
 float maxTemperature = 0.0f;
 float lastTemperatureC = 0.0f;
 bool lastTemperatureValid = false;
@@ -359,7 +381,7 @@ RTC_DATA_ATTR int32_t rtcSleepOffsetMin = 0;
 RTC_DATA_ATTR uint32_t rtcSleepCycleCount = 0;
 
 // -- Configurable thresholds
-uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
+uint32_t minAcceptableRate = 50;        // Minimum recent output rate for a warning
 uint32_t performanceCheckInterval = 15; // Check interval in minutes
 uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
 
@@ -384,7 +406,7 @@ uint32_t wifiReconnectCount = 0;
 uint32_t restartCounter = 0;
 String rebootReason = "unknown";
 uint32_t audioI2SErrorCount = 0;
-uint32_t audioRingBufferDropCount = 0;
+volatile uint32_t audioRingBufferDropCount = 0;
 uint32_t audioRingBufferChunkCount = 0;
 uint32_t audioRingBufferFlushCount = 0;
 bool audioRingBufferFlushPending = false;
@@ -802,9 +824,13 @@ static String mqttBuildDeviceJson() {
     return json;
 }
 
-static uint32_t calculatePacketRate(uint32_t packets, uint32_t runtimeMs) {
-    if (runtimeMs == 0) return 0;
-    return (uint32_t)(((uint64_t)packets * 1000ULL) / runtimeMs);
+uint32_t getCurrentPacketRate(uint8_t profileIndex) {
+    uint32_t now = millis();
+    if (profileIndex < 2) {
+        return streamStats[profileIndex].streaming
+            ? recentStreamRate[profileIndex].rate(now, streamStats[profileIndex].packetsSent) : 0;
+    }
+    return isStreaming ? recentAudioRate.rate(now, audioPacketsSent) : 0;
 }
 
 static String mqttBuildStateJson() {
@@ -812,8 +838,7 @@ static String mqttBuildStateJson() {
     unsigned long uptimeSeconds = (nowMs - bootTime) / 1000;
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
-    unsigned long runtime = nowMs - lastStatsReset;
-    uint32_t currentRate = (isStreaming && runtime > 1000) ? calculatePacketRate(audioPacketsSent, runtime) : 0;
+    uint32_t currentRate = getCurrentPacketRate(255);
     uint32_t streamUptimeSeconds = (isStreaming && streamStartedAtMs > 0 && nowMs >= streamStartedAtMs)
                                        ? (uint32_t)((nowMs - streamStartedAtMs) / 1000UL)
                                        : 0;
@@ -823,10 +848,7 @@ static String mqttBuildStateJson() {
     uint32_t streamRate[2] = {0, 0};
     uint32_t streamLastPlayAge[2] = {0, 0};
     for (uint8_t i = 0; i < 2; i++) {
-        unsigned long streamRuntime = nowMs - streamStats[i].statsResetMs;
-        if (streamStats[i].streaming && streamRuntime > 1000) {
-            streamRate[i] = calculatePacketRate(streamStats[i].packetsSent, streamRuntime);
-        }
+        streamRate[i] = getCurrentPacketRate(i);
         if (streamStats[i].lastPlayMs > 0 && nowMs >= streamStats[i].lastPlayMs) {
             streamLastPlayAge[i] = (uint32_t)((nowMs - streamStats[i].lastPlayMs) / 1000UL);
         }
@@ -930,15 +952,21 @@ static const MqttDiscoveryEntity MQTT_DISCOVERY_ENTITIES[] = {
     {"button", "reboot"},
 };
 
+static bool mqttStatePublishPending = false;
+
 static bool mqttPublishState(bool force) {
+    // RTSP/UI/callback paths only request publication. Coalesce their updates
+    // and send the current state after audio has progressed in the main loop.
+    if (force) { mqttStatePublishPending = true; return true; }
     if (!mqttClient.connected()) return false;
     unsigned long now = millis();
     unsigned long intervalMs = (unsigned long)mqttPublishIntervalSec * 1000UL;
-    if (!force && (now - lastMqttPublishMs) < intervalMs) return true;
+    if (!mqttStatePublishPending && (now - lastMqttPublishMs) < intervalMs) return true;
     String topic = mqttStateTopic();
     String payload = mqttBuildStateJson();
     bool ok = mqttClient.publish(topic.c_str(), payload.c_str(), false);
     if (ok) {
+        mqttStatePublishPending = false;
         lastMqttPublishMs = now;
         if (mqttLastError == "state_publish_failed") {
             mqttLastError = mqttDiscoveryProgress.failed ? "discovery_publish_failed" : "ok";
@@ -1084,9 +1112,7 @@ static void mqttScheduleDiscovery() {
 static void mqttServiceDiscovery() {
     if (!mqttClient.connected() || !mqttForceDiscovery) return;
     if (!mqttDiscoveryProgress.ready(millis())) return;
-    mqttNetClient.discoveryWrite = true;
     bool ok = mqttPublishDiscoveryStep(mqttDiscoveryProgress.step);
-    mqttNetClient.discoveryWrite = false;
     mqttDiscoveryProgress.completeStep(ok, millis());
     if (!ok) mqttLastError = "discovery_publish_failed";
     if (mqttDiscoveryProgress.done()) {
@@ -1908,24 +1934,27 @@ void checkPerformance() {
     }
 
     if (isStreaming && (millis() - lastStatsReset) > 30000) {
-        uint32_t runtime = millis() - lastStatsReset;
-        uint32_t currentRate = calculatePacketRate(audioPacketsSent, runtime);
+        uint32_t currentRate = getCurrentPacketRate(255);
 
         if (currentRate > maxPacketRate) maxPacketRate = currentRate;
         if (currentRate < minPacketRate) minPacketRate = currentRate;
 
         if (currentRate < minAcceptableRate) {
-            simplePrintln("PERFORMANCE DEGRADATION DETECTED!");
-            simplePrintln("Rate " + String(currentRate) + " < minimum " + String(minAcceptableRate) + " pkt/s");
-
-            if (autoRecoveryEnabled) {
-                simplePrintln("AUTO-RECOVERY: Restarting I2S...");
-                restartI2S();
-                audioPacketsSent = 0;
-                lastStatsReset = millis();
-                lastI2SReset = millis();
-            }
+            simplePrintln("Stream output below configured minimum.");
         }
+    }
+}
+
+void checkAudioProducerHealth() {
+    // Read the cross-task timestamp before the clock to avoid treating a newer
+    // producer timestamp as an unsigned negative age.
+    uint32_t lastRead = audioProducerLastReadMs;
+    uint32_t now = millis();
+    if (autoRecoveryEnabled && isStreaming &&
+        audioProducerNeedsRecovery(now, lastRead, audioProducerStopRequested, lastI2SReset)) {
+        lastI2SReset = now;
+        simplePrintln("AUTO-RECOVERY: Audio capture stopped; restarting I2S.");
+        restartI2S();
     }
 }
 
@@ -2391,6 +2420,7 @@ bool applyMicFormatConfig(uint8_t newFormat) {
 
 // Restart I2S with new parameters
 bool restartI2S() {
+    lastI2SReset = millis();
     simplePrintln("Restarting I2S with new parameters...");
     stopAllRtspClients("I2S restart");
     stopAudioProducer();
@@ -2465,8 +2495,9 @@ static size_t computeAudioRingBufferCapacity() {
     else if (currentBufferSize > 2048) chunkCount = 4;
     size_t capacity = chunkBytes * chunkCount;
     // Keep RTP packets small for UDP compatibility while providing roughly
-    // 32 chunks (~341 ms at 48 kHz/512 samples) of internal TCP jitter reserve.
-    if (currentBufferSize <= 2048 && capacity < 32768) capacity = 32768;
+    // 64 chunks (~683 ms at 48 kHz/512 samples) of internal TCP jitter reserve.
+    // Extra reserve is drained on recovery, rather than adding a fixed delay.
+    if (currentBufferSize <= 2048 && capacity < 65536) capacity = 65536;
     if (capacity < 4096) capacity = 4096;
     return capacity;
 }
@@ -2503,6 +2534,7 @@ void audioProducerTask(void* /*arg*/) {
 
         int samplesRead = bytesRead / sizeof(int32_t);
         if (samplesRead <= 0) continue;
+        audioProducerLastReadMs = millis();
 
         // If HPF params changed dynamically, recompute in the producer context.
         if (highpassEnabled && (hpfConfigSampleRate != currentSampleRate || hpfConfigCutoff != highpassCutoffHz)) {
@@ -2584,6 +2616,7 @@ bool startAudioProducer() {
     }
 
     audioProducerStopRequested = false;
+    audioProducerLastReadMs = millis();
     BaseType_t rc = xTaskCreate(
         audioProducerTask,
         "audio_prod",
@@ -2683,65 +2716,30 @@ bool setup_i2s_driver() {
     return true;
 }
 
-// The Wi-Fi/TCP transport pause occurs first; a blocked socket write is its
-// consequence, not its origin. Allow brief pauses to recover without forcing
-// BirdNET-Go through a much longer FFmpeg reconnect. The old blocking
-// NetworkClient::write() could then hold the main loop for about 10 seconds;
-// keep the same ten-second tolerance, but implement it explicitly with
-// non-blocking sends so its behavior and failure cause remain controlled.
-static const uint32_t RTSP_WRITE_TIMEOUT_MS = 10000UL;
-// The ring buffer holds roughly 341 ms at the default 48 kHz / 512-sample
-// configuration. After a longer recovered stall, discard queued old audio so
-// the stream resumes live instead of retaining permanent latency.
-static const uint32_t RTSP_BACKLOG_FLUSH_AFTER_MS = 250UL;
-
-// Non-blocking write helper with a bounded retry window for TCP backpressure.
-// NetworkClient::write() can wait internally for about 10 seconds in Arduino-ESP32
-// 3.3.8, which would stall the main loop and fill the audio ring buffer.
-static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
-    size_t off = 0;
-    bool stalled = false;
-    unsigned long startMs = millis();
-    while (off < len) {
-        int socketFd = client.fd();
-        if (!client.connected() || socketFd < 0) {
-            return false;
-        }
-
-        if ((millis() - startMs) >= RTSP_WRITE_TIMEOUT_MS) {
-            rtspWriteTimeoutCount++;
-            return false;
-        }
-
-        errno = 0;
-        int w = send(socketFd, data + off, len - off, MSG_DONTWAIT);
-        if (w > 0) {
-            off += (size_t)w;
-            continue;
-        }
-
-        if (w == 0) {
-            return false;
-        }
-
-        int socketError = errno;
-        if (socketError != EAGAIN && socketError != EWOULDBLOCK &&
-            socketError != EINTR) {
-            return false;
-        }
-
-        if (!stalled) {
-            rtspWriteStallCount++;
-            stalled = true;
-        }
-        delay(1);
+static bool anotherSessionStreaming(const ClientSession &session) {
+    for (uint8_t i = 0; i < MAX_CLIENTS; ++i) {
+        if (&clients[i] != &session && clients[i].streaming) return true;
     }
+    return false;
+}
 
-    unsigned long elapsedMs = millis() - startMs;
-    if (stalled && elapsedMs >= RTSP_BACKLOG_FLUSH_AFTER_MS) {
-        audioRingBufferFlushPending = true;
+static void recordRtpSent(ClientSession &session, uint16_t samples, uint32_t chunk) {
+    session.rtpSequence++;
+    session.rtpTimestamp += samples;
+    session.packetsSent++;
+    session.lastRtpPacketMs = millis();
+    lastRtpPacketMs = session.lastRtpPacketMs;
+    // A chunk delivered to multiple clients is counted once per profile.
+    // Delayed copies from a slower client must not count the same chunk again.
+    uint8_t pi = session.profileIndex;
+    if ((int32_t)(chunk - countedProfileChunk[pi]) > 0) {
+        countedProfileChunk[pi] = chunk;
+        streamStats[pi].packetsSent++;
     }
-    return true;
+    if ((int32_t)(chunk - countedAudioChunk) > 0) {
+        countedAudioChunk = chunk;
+        audioPacketsSent++;
+    }
 }
 
 static void stopStreamOnWriteFailure(ClientSession &session, const char* reason) {
@@ -2749,9 +2747,10 @@ static void stopStreamOnWriteFailure(ClientSession &session, const char* reason)
     session.streaming = false;
     rtspWriteFailCount++;
     recordStreamStop(reason, pi + 1);
+    bool otherStreaming = anotherSessionStreaming(session);
     session.reset();
-    // Flush only after streamAudio() returns its currently borrowed item.
-    audioRingBufferFlushPending = true;
+    // A slow/failed client must not discard audio queued for other clients.
+    if (!otherStreaming) audioRingBufferFlushPending = true;
     bool anyStillStreaming = false;
     for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].streaming && clients[i].profileIndex == pi) { anyStillStreaming = true; break; }
@@ -2762,7 +2761,44 @@ static void stopStreamOnWriteFailure(ClientSession &session, const char* reason)
     mqttPublishState(true);
 }
 
-void sendRTPPacket(ClientSession &session, const int16_t* networkAudioData, int numSamples) {
+static void servicePendingTcp(ClientSession &session) {
+    if (!session.tcpWriter.pending()) return;
+    uint32_t now = millis();
+    bool wasStalled = session.tcpWriter.stalled();
+    auto result = session.tcpWriter.poll(now, [&](const uint8_t* data, size_t length) {
+        int fd = session.client.fd();
+        if (!session.client.connected() || fd < 0) { errno = ENOTCONN; return -1; }
+        return (int)send(fd, data, length, MSG_DONTWAIT);
+    });
+    if (!wasStalled && session.tcpWriter.stalled()) rtspWriteStallCount++;
+    if (result == CooperativeTcpWriter::TIMED_OUT) rtspWriteTimeoutCount++;
+    if (result == CooperativeTcpWriter::FAILED || result == CooperativeTcpWriter::TIMED_OUT) {
+        stopStreamOnWriteFailure(session, session.tcpFrameIsRtp ? "RTP write failed" : "RTSP write failed");
+        return;
+    }
+    if (result != CooperativeTcpWriter::COMPLETE) return;
+    if (shouldFlushRecoveredBacklog(session.tcpWriter.stalled(), session.streaming,
+                                    anotherSessionStreaming(session),
+                                    session.tcpFrameDropsAtQueue, audioRingBufferDropCount)) {
+        audioRingBufferFlushPending = true;
+    }
+    if (session.tcpFrameIsRtp) recordRtpSent(session, session.tcpFrameSamples, session.tcpFrameChunk);
+    session.tcpWriter.clear();
+    session.tcpFrameIsRtp = false;
+}
+
+static void queueRtspResponse(ClientSession &session, const String &response) {
+    session.tcpFrameIsRtp = false;
+    session.tcpFrameDropsAtQueue = audioRingBufferDropCount;
+    if (!session.tcpWriter.queue((const uint8_t*)response.c_str(), response.length(), millis())) {
+        stopStreamOnWriteFailure(session, "RTSP write failed");
+        return;
+    }
+    servicePendingTcp(session);
+}
+
+void sendRTPPacket(ClientSession &session, const int16_t* networkAudioData, int numSamples, uint32_t chunk) {
+    if (session.tcpWriter.pending()) return;
     const uint16_t payloadSize = (uint16_t)(numSamples * (int)sizeof(int16_t));
     const uint16_t packetSize = (uint16_t)(12 + payloadSize);
 
@@ -2797,12 +2833,16 @@ void sendRTPPacket(ClientSession &session, const int16_t* networkAudioData, int 
         memcpy(rtpPacketScratch + 4, header, sizeof(header));
         memcpy(rtpPacketScratch + 4 + sizeof(header), networkAudioData, payloadSize);
         size_t totalLen = 4 + sizeof(header) + payloadSize;
-        if (writeAll(session.client, rtpPacketScratch, totalLen)) {
-            success = true;
-        } else {
+        if (!session.tcpWriter.queue(rtpPacketScratch, totalLen, millis())) {
             stopStreamOnWriteFailure(session, "RTP write failed");
             return;
         }
+        session.tcpFrameIsRtp = true;
+        session.tcpFrameSamples = (uint16_t)numSamples;
+        session.tcpFrameChunk = chunk;
+        session.tcpFrameDropsAtQueue = audioRingBufferDropCount;
+        servicePendingTcp(session);
+        return;
     } else {
         if (session.clientRtpPort == 0) {
             session.streaming = false;
@@ -2816,11 +2856,7 @@ void sendRTPPacket(ClientSession &session, const int16_t* networkAudioData, int 
         }
     }
     if (success) {
-        session.rtpSequence++;
-        session.rtpTimestamp += (uint32_t)numSamples;
-        session.packetsSent++;
-        session.lastRtpPacketMs = millis();
-        lastRtpPacketMs = session.lastRtpPacketMs;
+        recordRtpSent(session, (uint16_t)numSamples, chunk);
     }
 }
 
@@ -2849,10 +2885,23 @@ void streamAudio() {
     if (!anyStreaming) return;
     if (!audioRingBuffer) return;
 
+    if (audioRingBufferFlushPending) {
+        audioRingBufferFlushPending = false;
+        flushAudioRingBuffer();
+    }
     uint8_t chunksProcessed = 0;
     while (chunksProcessed < 4) {
+        bool ready = false;
+        for (uint8_t i = 0; i < MAX_CLIENTS; ++i) {
+            if (clients[i].streaming && !clients[i].tcpWriter.pending()) { ready = true; break; }
+        }
+        if (!ready) break;
         size_t itemSize = 0;
-        int16_t* audioChunk = (int16_t*)xRingbufferReceive(audioRingBuffer, &itemSize, 0);
+        // Byte buffers merge adjacent producer writes. Only borrow the bytes
+        // this RTP packet can carry, so returning it cannot discard queued audio.
+        int16_t* audioChunk = (int16_t*)xRingbufferReceiveUpTo(
+            audioRingBuffer, &itemSize, 0,
+            (size_t)currentBufferSize * sizeof(int16_t));
         if (!audioChunk) break;
 
         int samplesRead = itemSize / sizeof(int16_t);
@@ -2864,23 +2913,10 @@ void streamAudio() {
             s = (uint16_t)((s << 8) | (s >> 8));
             i2s_16bit_network_buffer[i] = (int16_t)s;
         }
-        bool deliveredProfile[2] = {false, false};
+        uint32_t chunk = ++audioChunkSequence;
         for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
-            if (!clients[i].streaming) continue;
-            uint8_t pi = clients[i].profileIndex;
-            sendRTPPacket(clients[i], i2s_16bit_network_buffer, samplesRead);
-            if (clients[i].streaming) {
-                deliveredProfile[pi] = true;
-            }
-        }
-        bool deliveredAny = false;
-        for (uint8_t pi = 0; pi < 2; pi++) {
-            if (!deliveredProfile[pi]) continue;
-            streamStats[pi].packetsSent++;
-            deliveredAny = true;
-        }
-        if (deliveredAny) {
-            audioPacketsSent++;
+            if (!clients[i].streaming || clients[i].tcpWriter.pending()) continue;
+            sendRTPPacket(clients[i], i2s_16bit_network_buffer, samplesRead, chunk);
         }
         vRingbufferReturnItem(audioRingBuffer, (void*)audioChunk);
         if (audioRingBufferFlushPending) {
@@ -2962,6 +2998,8 @@ static void parseTransportHeader(ClientSession &session, const String &request, 
 
 // RTSP handling
 void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx) {
+    String response;
+    response.reserve(512);
     String cseq = "1";
     int cseqPos = request.indexOf("CSeq: ");
     if (cseqPos >= 0) {
@@ -2978,10 +3016,11 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
 
     // Reject disabled streams
     if (!streamEnabled[session.profileIndex]) {
-        session.client.print("RTSP/1.0 454 Session Not Found\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n");
-        session.client.print("\r\n");
+        response += "RTSP/1.0 454 Session Not Found\r\n";
+        response += "CSeq: " + cseq + "\r\n";
+        response += "\r\n";
         simplePrintln("Rejected disabled stream" + String(session.profileIndex + 1) + " from " + session.client.remoteIP().toString());
+        queueRtspResponse(session, response);
         return;
     }
 
@@ -2992,9 +3031,9 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
     lastRTSPActivity = lastRtspCommandMs;
 
     if (request.startsWith("OPTIONS")) {
-        session.client.print("RTSP/1.0 200 OK\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n");
-        session.client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n");
+        response += "RTSP/1.0 200 OK\r\n";
+        response += "CSeq: " + cseq + "\r\n";
+        response += "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n";
 
     } else if (request.startsWith("DESCRIBE")) {
         String ip = WiFi.localIP().toString();
@@ -3008,31 +3047,31 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         sdp += "a=rtpmap:96 L16/" + String(currentSampleRate) + "/1\r\n";
         sdp += "a=control:track1\r\n";
 
-        session.client.print("RTSP/1.0 200 OK\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n");
-        session.client.print("Content-Type: application/sdp\r\n");
-        session.client.print("Content-Base: rtsp://" + ip + ":8554" + streamPath + "/\r\n");
-        session.client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
-        session.client.print(sdp);
+        response += "RTSP/1.0 200 OK\r\n";
+        response += "CSeq: " + cseq + "\r\n";
+        response += "Content-Type: application/sdp\r\n";
+        response += "Content-Base: rtsp://" + ip + ":8554" + streamPath + "/\r\n";
+        response += "Content-Length: " + String(sdp.length()) + "\r\n\r\n";
+        response += sdp;
 
     } else if (request.startsWith("SETUP")) {
         session.sessionId = String(random(100000000, 999999999));
         rtspSessionId = session.sessionId;
         String transportResponse;
         parseTransportHeader(session, request, transportResponse, clientIdx);
-        session.client.print("RTSP/1.0 200 OK\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n");
-        session.client.print("Session: " + session.sessionId + "\r\n");
-        session.client.print("Transport: " + transportResponse + "\r\n\r\n");
+        response += "RTSP/1.0 200 OK\r\n";
+        response += "CSeq: " + cseq + "\r\n";
+        response += "Session: " + session.sessionId + "\r\n";
+        response += "Transport: " + transportResponse + "\r\n\r\n";
 
     } else if (request.startsWith("PLAY")) {
         String ip = WiFi.localIP().toString();
         String streamPath = (session.profileIndex == 1) ? "/audio2" : "/audio1";
-        session.client.print("RTSP/1.0 200 OK\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n");
-        session.client.print("Session: " + session.sessionId + "\r\n");
-        session.client.print("Range: npt=0.000-\r\n");
-        session.client.print("RTP-Info: url=rtsp://" + ip + ":8554" + streamPath + "/track1;seq=0;rtptime=0\r\n\r\n");
+        response += "RTSP/1.0 200 OK\r\n";
+        response += "CSeq: " + cseq + "\r\n";
+        response += "Session: " + session.sessionId + "\r\n";
+        response += "Range: npt=0.000-\r\n";
+        response += "RTP-Info: url=rtsp://" + ip + ":8554" + streamPath + "/track1;seq=0;rtptime=0\r\n\r\n";
 
         bool wasAnyStreaming = anyRtspSessionStreaming();
         bool wasProfileStreaming = anyRtspSessionStreaming(session.profileIndex);
@@ -3048,6 +3087,7 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         if (!wasAnyStreaming) {
             audioPacketsSent = 0;
             lastStatsReset = millis();
+            recentAudioRate.reset(lastStatsReset, audioPacketsSent);
             streamStartedAtMs = millis();
         }
         lastRtspPlayMs = millis();
@@ -3056,6 +3096,8 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         if (!wasProfileStreaming) {
             streamStats[session.profileIndex].packetsSent = 0;
             streamStats[session.profileIndex].statsResetMs = millis();
+            recentStreamRate[session.profileIndex].reset(
+                streamStats[session.profileIndex].statsResetMs, 0);
         }
         rtspPlayCount++;
         lastRtpPacketMs = millis();
@@ -3092,9 +3134,9 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         teardownLog += String(WiFi.RSSI());
         teardownLog += F("dBm user_agent=");
         teardownLog += session.userAgent[0] ? session.userAgent : "unknown";
-        session.client.print("RTSP/1.0 200 OK\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n");
-        session.client.print("Session: " + session.sessionId + "\r\n\r\n");
+        response += "RTSP/1.0 200 OK\r\n";
+        response += "CSeq: " + cseq + "\r\n";
+        response += "Session: " + session.sessionId + "\r\n\r\n";
         bool wasStreaming = session.streaming;
         session.streaming = false;
         bool anyStillStreaming = false;
@@ -3110,53 +3152,67 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         if (wasStreaming) simplePrintln("STREAMING STOPPED (" + lastStreamStopReason + ")");
         mqttPublishState(true);
     } else if (request.startsWith("GET_PARAMETER")) {
-        session.client.print("RTSP/1.0 200 OK\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n\r\n");
+        response += "RTSP/1.0 200 OK\r\n";
+        response += "CSeq: " + cseq + "\r\n\r\n";
     } else {
-        session.client.print("RTSP/1.0 501 Not Implemented\r\n");
-        session.client.print("CSeq: " + cseq + "\r\n\r\n");
+        response += "RTSP/1.0 501 Not Implemented\r\n";
+        response += "CSeq: " + cseq + "\r\n\r\n";
         simplePrintln("RTSP unsupported command: " + lastRtspCommand);
     }
+    queueRtspResponse(session, response);
 }
 
 // RTSP processing
 void processRTSP(ClientSession &session, uint8_t clientIdx) {
-    if (!session.client.connected()) return;
-    while (session.client.available()) {
-        int available = session.client.available();
-        if (session.parseBufferPos + available >= (int)sizeof(session.parseBuffer)) {
-            available = sizeof(session.parseBuffer) - session.parseBufferPos - 1;
-            if (available <= 0) {
-                simplePrintln("RTSP buffer overflow - resetting");
-                session.parseBufferPos = 0;
-                return;
-            }
+    if (!session.client.connected() || session.tcpWriter.pending()) return;
+    // Bound input work too. TCP RTCP frames can contain NUL bytes or exceed
+    // the text buffer; discard their declared binary length before parsing.
+    uint8_t passes = 0;
+    while (passes++ < 8) {
+        if (session.interleavedBytesRemaining && session.parseBufferPos) {
+            int skip = session.parseBufferPos;
+            if (skip > session.interleavedBytesRemaining) skip = session.interleavedBytesRemaining;
+            session.interleavedBytesRemaining -= skip;
+            session.parseBufferPos -= skip;
+            memmove(session.parseBuffer, session.parseBuffer + skip, session.parseBufferPos);
+            session.parseBuffer[session.parseBufferPos] = '\0';
+            continue;
         }
+        if (!session.interleavedBytesRemaining && session.parseBufferPos >= 4 && session.parseBuffer[0] == '$') {
+            session.interleavedBytesRemaining = (uint16_t(session.parseBuffer[2]) << 8) | session.parseBuffer[3];
+            session.parseBufferPos -= 4;
+            memmove(session.parseBuffer, session.parseBuffer + 4, session.parseBufferPos);
+            session.parseBuffer[session.parseBufferPos] = '\0';
+            continue;
+        }
+        char* endOfHeader = (!session.interleavedBytesRemaining && session.parseBuffer[0] != '$')
+            ? strstr((char*)session.parseBuffer, "\r\n\r\n") : nullptr;
+        if (endOfHeader) {
+            int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
+            *endOfHeader = '\0';
+            String request((char*)session.parseBuffer);
+            int remaining = session.parseBufferPos - headerLen;
+            if (remaining > 0) memmove(session.parseBuffer, session.parseBuffer + headerLen, remaining);
+            session.parseBufferPos = remaining;
+            session.parseBuffer[remaining] = '\0';
+            handleRTSPCommand(session, request, clientIdx);
+            if (!session.client.connected() || session.tcpWriter.pending()) return;
+            continue;
+        }
+        int available = session.client.available();
+        if (available <= 0) return;
+        int room = sizeof(session.parseBuffer) - session.parseBufferPos - 1;
+        if (room <= 0) {
+            simplePrintln("RTSP buffer overflow - resetting");
+            session.parseBufferPos = 0;
+            session.parseBuffer[0] = '\0';
+            return;
+        }
+        if (available > room) available = room;
         int bytesRead = session.client.read(session.parseBuffer + session.parseBufferPos, available);
         if (bytesRead <= 0) return;
         session.parseBufferPos += bytesRead;
         session.parseBuffer[session.parseBufferPos] = '\0';
-
-        while (true) {
-            char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
-            if (endOfHeader == nullptr) break;
-            *endOfHeader = '\0';
-            String request = String((char*)session.parseBuffer);
-
-            handleRTSPCommand(session, request, clientIdx);
-
-            int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
-            if (headerLen > session.parseBufferPos) {
-                session.parseBufferPos = 0;
-                break;
-            }
-            int remaining = session.parseBufferPos - headerLen;
-            if (remaining > 0) {
-                memmove(session.parseBuffer, session.parseBuffer + headerLen, remaining);
-            }
-            session.parseBufferPos = remaining;
-            session.parseBuffer[session.parseBufferPos] = '\0';
-        }
     }
 }
 
@@ -3438,6 +3494,11 @@ void loop() {
         lastPerformanceCheck = millis();
     }
 
+    if (millis() - lastProducerHealthCheck >= 1000UL) {
+        checkAudioProducerHealth();
+        lastProducerHealthCheck = millis();
+    }
+
     if (millis() - lastWiFiCheck > 30000) { // 30 s
         checkWiFiHealth(); // without TX power log spam
         lastWiFiCheck = millis();
@@ -3451,7 +3512,6 @@ void loop() {
     }
 
     checkScheduledReset();
-    checkMqtt();
 
     // RTSP client management (configurable 1-3 concurrent sessions)
     if (rtspServerEnabled) {
@@ -3498,6 +3558,8 @@ void loop() {
 
         for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].client.connected()) {
+                servicePendingTcp(clients[i]);
+                if (!clients[i].client.connected()) continue;
                 drainRtcpPackets(clients[i]);
                 if (clients[i].client.available()) {
                     clients[i].lastActivity = millis();
@@ -3511,6 +3573,10 @@ void loop() {
         stopAllRtspClients("RTSP server disabled");
     }
     refreshLegacyRtspState();
+    uint32_t rateNow = millis();
+    recentAudioRate.update(rateNow, audioPacketsSent);
+    for (uint8_t i = 0; i < 2; ++i) recentStreamRate[i].update(rateNow, streamStats[i].packetsSent);
+    checkMqtt();
     // Handle deferred WiFi reconnect
     if (wifiReconnectAt != 0 && millis() >= wifiReconnectAt) {
         wifiReconnectAt = 0;
