@@ -352,13 +352,14 @@
 <select id='sel_mic_format'>
 <option value='0'>ICS-43434 / INMP441 (Philips I2S)</option>
 <option value='1'>Adafruit SPH0645 (MSB / left-justified)</option>
+<option value='2' id='opt_mic_pdm'>PDM MEMS, e.g. IM73D122 (CLK=BCLK pin, DATA=SD pin, 48 kHz only)</option>
 </select>
 <button onclick="setv('mic_format',sel_mic_format.value)">Set</button>
 </div>
 </td>
 </tr>
 <tr id='row_mic_format_hint' style='display:none'>
-<td colspan='2'><div class='hint'>A wrong selection cannot damage the microphone; it only decodes its bits at the wrong position and causes bad audio. Philips I2S is the default for existing installations.</div></td>
+<td colspan='2'><div class='hint'>A wrong selection cannot damage the microphone; it only decodes its bits at the wrong position and causes bad audio. Philips I2S is the default for existing installations. PDM (ESP32-S3 only) reuses the BCLK pin as the PDM clock and the SD pin as data, leaves WS unused, locks the sample rate to 48 kHz, and ignores the shift-bits setting.</div></td>
 </tr>
 <tr>
 <td class='k'>
@@ -1047,7 +1048,9 @@ trackEdit($('sel_max_clients'),'max_clients'); trackEdit($('in_mqtt_host'),'mqtt
   if(help&&hint) help.onclick=()=>{hint.style.display=(hint.style.display==='none')?'':'none';};
   if(select&&typeof trackEdit==='function') trackEdit(select,'mic_format');
   fetch('/api/audio_status',{cache:'no-store'}).then(r=>r.json()).then(j=>{
-    if(select&&(j.mic_format===0||j.mic_format===1)) select.value=String(j.mic_format);
+    const pdmOpt=document.getElementById('opt_mic_pdm');
+    if(pdmOpt&&j.pdm_supported!==true) pdmOpt.remove();
+    if(select&&(j.mic_format===0||j.mic_format===1||(j.mic_format===2&&j.pdm_supported===true))) select.value=String(j.mic_format);
   }).catch(()=>{});
 })();
 </script>

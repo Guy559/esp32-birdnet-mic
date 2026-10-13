@@ -3,6 +3,8 @@
 #include <esp_wifi.h>
 #include <WiFiManager.h>
 #include "driver/i2s_std.h"
+#include "driver/i2s_pdm.h"
+#include "soc/soc_caps.h"
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
@@ -147,10 +149,31 @@ enum StreamTarget : uint8_t {
 
 enum MicFormat : uint8_t {
     MIC_FORMAT_PHILIPS = 0,  // ICS-43434 / INMP441
-    MIC_FORMAT_MSB = 1       // Adafruit SPH0645LM4H
+    MIC_FORMAT_MSB = 1,      // Adafruit SPH0645LM4H
+    MIC_FORMAT_PDM = 2       // PDM MEMS (e.g. Infineon IM73D122), hardware PDM->PCM
 };
 
 static constexpr uint8_t DEFAULT_MIC_FORMAT = MIC_FORMAT_PHILIPS;
+
+// PDM capture uses the I2S0 hardware PDM->PCM filter, which only exists on
+// chips with SOC_I2S_SUPPORTS_PDM2PCM (ESP32-S3 among the supported boards).
+// C3/C5/C6 can only read the raw bitstream, which would need a software
+// CIC/FIR decimator, so the option is compiled out there.
+#if SOC_I2S_SUPPORTS_PDM2PCM
+static constexpr bool PDM_MIC_SUPPORTED = true;
+#else
+static constexpr bool PDM_MIC_SUPPORTED = false;
+#endif
+// The PDM->PCM filter outputs 16-48 kHz PCM; with DSR_8S the PDM
+// clock is 64 x fs, so 48 kHz gives 3.072 MHz (IM73D122 high-performance mode).
+static constexpr uint32_t PDM_SAMPLE_RATE = 48000;
+
+static bool micFormatSupported(uint8_t format) {
+    if (format == MIC_FORMAT_PHILIPS || format == MIC_FORMAT_MSB) return true;
+    return format == MIC_FORMAT_PDM && PDM_MIC_SUPPORTED;
+}
+
+bool pdmMicSupported() { return PDM_MIC_SUPPORTED; }
 
 struct StreamProfileConfig {
     uint8_t target = STREAM_TARGET_BIRDNET_GO;
@@ -216,6 +239,7 @@ struct ClientSession {
 };
 
 static const char* micFormatName(uint8_t format) {
+    if (format == MIC_FORMAT_PDM) return "PDM";
     return format == MIC_FORMAT_MSB ? "SPH0645/MSB" : "ICS43434/Philips";
 }
 
@@ -2104,8 +2128,12 @@ void loadAudioSettings() {
         i2sShiftBits = 12;
         settingsRepaired = true;
     }
-    if (micFormat > MIC_FORMAT_MSB) {
+    if (!micFormatSupported(micFormat)) {
         micFormat = DEFAULT_MIC_FORMAT;
+        settingsRepaired = true;
+    }
+    if (micFormat == MIC_FORMAT_PDM && currentSampleRate != PDM_SAMPLE_RATE) {
+        currentSampleRate = PDM_SAMPLE_RATE;
         settingsRepaired = true;
     }
     if (resetIntervalHours < 1U || resetIntervalHours > 168U) {
@@ -2377,6 +2405,11 @@ bool applyAudioConfig(uint32_t newRate, float newGain, uint16_t newBuffer, uint8
     uint16_t oldCutoff = highpassCutoffHz;
     uint32_t oldMinRate = minAcceptableRate;
 
+    if (micFormat == MIC_FORMAT_PDM && newRate != PDM_SAMPLE_RATE) {
+        simplePrintln("Audio setting rejected: PDM microphone mode is fixed at 48000 Hz.");
+        return false;
+    }
+
     stopAudioProducer();
     currentSampleRate = newRate;
     currentGainFactor = newGain;
@@ -2400,18 +2433,28 @@ bool applyAudioConfig(uint32_t newRate, float newGain, uint16_t newBuffer, uint8
     return false;
 }
 
-// Change only the receiver's sample alignment. This does not change GPIO
-// direction, voltage, BCLK frequency, WS frequency, or microphone power.
+// Change the receiver mode. Philips/MSB only change sample alignment. PDM
+// switches I2S0 to PDM RX: BCLK pin becomes the PDM clock output, SD pin the
+// PDM data input, WS/MCLK are released, and the rate is forced to 48 kHz.
 bool applyMicFormatConfig(uint8_t newFormat) {
-    if (newFormat > MIC_FORMAT_MSB) return false;
+    if (!micFormatSupported(newFormat)) return false;
     if (newFormat == micFormat) return true;
 
     uint8_t oldFormat = micFormat;
+    uint32_t oldRate = currentSampleRate;
+    uint16_t oldCutoff = highpassCutoffHz;
+    stopAudioProducer();
     micFormat = newFormat;
+    if (micFormat == MIC_FORMAT_PDM) {
+        currentSampleRate = PDM_SAMPLE_RATE;
+        highpassCutoffHz = normalizeHighpassCutoff(currentSampleRate, highpassCutoffHz);
+    }
     if (restartI2S()) return true;
 
     simplePrintln("Mic format setting rejected: I2S restart failed, rolling back.");
     micFormat = oldFormat;
+    currentSampleRate = oldRate;
+    highpassCutoffHz = oldCutoff;
     if (!restartI2S()) {
         simplePrintln("Mic format rollback failed; reboot recommended.");
     }
@@ -2518,11 +2561,16 @@ void flushAudioRingBuffer() {
 
 void audioProducerTask(void* /*arg*/) {
     audioProducerRunning = true;
+    // Format only changes while the producer is stopped, so latch it once.
+    // PDM->PCM delivers 16-bit samples; reuse the 32-bit buffer's storage.
+    const bool pdmCapture = (micFormat == MIC_FORMAT_PDM);
+    const size_t bytesPerSample = pdmCapture ? sizeof(int16_t) : sizeof(int32_t);
+    const int16_t* pdmSamples = reinterpret_cast<const int16_t*>(i2s_32bit_buffer);
 
     while (!audioProducerStopRequested) {
         size_t bytesRead = 0;
         esp_err_t result = i2s_channel_read(i2s_rx_handle, i2s_32bit_buffer,
-                                            currentBufferSize * sizeof(int32_t),
+                                            currentBufferSize * bytesPerSample,
                                             &bytesRead, 100);
         if (audioProducerStopRequested) break;
 
@@ -2532,7 +2580,7 @@ void audioProducerTask(void* /*arg*/) {
             continue;
         }
 
-        int samplesRead = bytesRead / sizeof(int32_t);
+        int samplesRead = bytesRead / bytesPerSample;
         if (samplesRead <= 0) continue;
         audioProducerLastReadMs = millis();
 
@@ -2544,7 +2592,8 @@ void audioProducerTask(void* /*arg*/) {
         bool clipped = false;
         float peakAbs = 0.0f;
         for (int i = 0; i < samplesRead; i++) {
-            float sample = (float)(i2s_32bit_buffer[i] >> i2sShiftBits);
+            float sample = pdmCapture ? (float)pdmSamples[i]
+                                      : (float)(i2s_32bit_buffer[i] >> i2sShiftBits);
             if (highpassEnabled) sample = hpf.process(sample);
             float amplified = sample * currentGainFactor;
             float aabs = fabsf(amplified);
@@ -2658,6 +2707,26 @@ bool setup_i2s_driver() {
         return false;
     }
 
+#if SOC_I2S_SUPPORTS_PDM2PCM
+    if (micFormat == MIC_FORMAT_PDM) {
+        // Reuse existing wiring: BCLK pin -> PDM CLK out, SD pin -> PDM DATA in.
+        // Mic SELECT/LR tied to GND = left slot. If audio is silent or noise,
+        // the mic is driving the other clock edge: tie SELECT high or change
+        // slot_mask to I2S_PDM_SLOT_RIGHT.
+        i2s_pdm_rx_config_t pdm_cfg = {
+            .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(PDM_SAMPLE_RATE),
+            .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        };
+        // gpio_cfg holds an anonymous din/dins[] union; assign instead of
+        // designated-initializing it so the C++ build stays portable.
+        pdm_cfg.gpio_cfg.clk = (gpio_num_t)I2S_BCLK_PIN;
+        pdm_cfg.gpio_cfg.din = (gpio_num_t)I2S_DOUT_PIN;
+        pdm_cfg.gpio_cfg.invert_flags.clk_inv = false;
+        pdm_cfg.slot_cfg.slot_mask = I2S_PDM_SLOT_LEFT;
+        err = i2s_channel_init_pdm_rx_mode(i2s_rx_handle, &pdm_cfg);
+    } else
+#endif
+    {
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
@@ -2685,6 +2754,7 @@ bool setup_i2s_driver() {
     }
 
     err = i2s_channel_init_std_mode(i2s_rx_handle, &std_cfg);
+    }
     if (err != ESP_OK) {
         simplePrintln("I2S pin/mode setup failed: " + String(esp_err_to_name(err)));
         i2s_del_channel(i2s_rx_handle);
@@ -2700,7 +2770,8 @@ bool setup_i2s_driver() {
         return false;
     }
 
-    simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
+    simplePrintln(String(micFormat == MIC_FORMAT_PDM ? "PDM" : "I2S") +
+                  " ready: " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   ", shiftBits " + String(i2sShiftBits) +
                   ", micFormat " + String(micFormatName(micFormat)) +

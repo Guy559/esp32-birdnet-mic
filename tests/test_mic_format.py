@@ -19,17 +19,32 @@ class MicFormatContractTest(unittest.TestCase):
     def test_setting_is_validated_and_persisted(self):
         self.assertIn('getUChar("micFormat", DEFAULT_MIC_FORMAT)', SKETCH)
         self.assertIn('putUChar("micFormat", micFormat)', SKETCH)
-        self.assertIn("if (micFormat > MIC_FORMAT_MSB)", SKETCH)
-        self.assertIn("if (newFormat > MIC_FORMAT_MSB) return false;", SKETCH)
+        self.assertIn("if (!micFormatSupported(micFormat))", SKETCH)
+        self.assertIn("if (!micFormatSupported(newFormat)) return false;", SKETCH)
         self.assertIn("micFormat = oldFormat;", SKETCH)
 
     def test_api_and_ui_contract(self):
         self.assertIn('"\\\"mic_format\\\":" + String(micFormat)', WEBUI_CPP)
         self.assertIn('key == "mic_format"', WEBUI_CPP)
-        self.assertIn("v <= 1", WEBUI_CPP)
+        self.assertIn("v <= 2", WEBUI_CPP)
+        self.assertIn('\"pdm_supported\\"', WEBUI_CPP)
         self.assertIn("id='sel_mic_format'", WEBUI_HTML)
         self.assertIn("Adafruit SPH0645", WEBUI_HTML)
         self.assertIn("cannot damage the microphone", WEBUI_HTML)
+
+    def test_pdm_option(self):
+        self.assertIn("MIC_FORMAT_PDM = 2", SKETCH)
+        self.assertIn("#if SOC_I2S_SUPPORTS_PDM2PCM", SKETCH)
+        self.assertIn("i2s_channel_init_pdm_rx_mode", SKETCH)
+        self.assertIn("I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT", SKETCH)
+        self.assertIn("PDM_SAMPLE_RATE = 48000", SKETCH)
+        # PDM is fixed-rate: other rates are rejected, stored settings repaired.
+        self.assertIn("micFormat == MIC_FORMAT_PDM && newRate != PDM_SAMPLE_RATE", SKETCH)
+        self.assertIn("micFormat == MIC_FORMAT_PDM && currentSampleRate != PDM_SAMPLE_RATE", SKETCH)
+        # 16-bit PDM samples are read without the I2S shift.
+        self.assertIn("bytesRead / bytesPerSample", SKETCH)
+        self.assertIn("id='opt_mic_pdm'", WEBUI_HTML)
+        self.assertIn("j.pdm_supported!==true", WEBUI_HTML)
 
 
 if __name__ == "__main__":

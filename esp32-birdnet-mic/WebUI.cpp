@@ -129,6 +129,7 @@ extern String formatSince(unsigned long eventMs);
 extern bool restartI2S();
 extern bool applyAudioConfig(uint32_t newRate, float newGain, uint16_t newBuffer, uint8_t newShift);
 extern bool applyMicFormatConfig(uint8_t newFormat);
+extern bool pdmMicSupported();
 extern uint16_t maxHighpassCutoffForRate(uint32_t sampleRate);
 extern void saveAudioSettings();
 extern void applyWifiTxPower(bool log);
@@ -929,6 +930,7 @@ static void httpAudioStatus() {
     json += "\"buffer_size\":" + String(currentBufferSize) + ",";
     json += "\"i2s_shift\":" + String(i2sShiftBits) + ",";
     json += "\"mic_format\":" + String(micFormat) + ",";
+    json += "\"pdm_supported\":" + String(pdmMicSupported() ? "true" : "false") + ",";
     json += "\"latency_ms\":" + String(latency_ms,1) + ",";
     extern bool highpassEnabled; extern uint16_t highpassCutoffHz;
     json += "\"profile\":\"" + jsonEscape(profileName(currentBufferSize)) + "\",";
@@ -1382,7 +1384,7 @@ static void httpSet() {
     else if (key == "mic_format") {
         handled = true;
         uint8_t v;
-        if (argToUChar(v) && v <= 1) {
+        if (argToUChar(v) && v <= 2) {
             applied = applyAndSaveMicFormat(v);
         }
     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Audio: optional PDM microphone mode (e.g. Infineon IM73D122) on ESP32-S3, using the hardware PDM-to-PCM filter. The BCLK pin drives the PDM clock and the SD pin reads PDM data; WS is unused. PDM mode is fixed at 48 kHz (3.072 MHz PDM clock) and ignores shift bits. The option is hidden on boards without hardware PDM-to-PCM (C3/C5/C6).
+
 ## 1.26 - 2026-10-11
 
 - Streaming: more efficient RTSP/TCP sending keeps the Web UI and other connected clients responsive.
