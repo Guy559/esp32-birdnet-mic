@@ -168,13 +168,6 @@ static constexpr bool PDM_MIC_SUPPORTED = false;
 // clock is 64 x fs, so 48 kHz gives 3.072 MHz (IM73D122 high-performance mode).
 static constexpr uint32_t PDM_SAMPLE_RATE = 48000;
 
-static bool micFormatSupported(uint8_t format) {
-    if (format == MIC_FORMAT_PHILIPS || format == MIC_FORMAT_MSB) return true;
-    return format == MIC_FORMAT_PDM && PDM_MIC_SUPPORTED;
-}
-
-bool pdmMicSupported() { return PDM_MIC_SUPPORTED; }
-
 struct StreamProfileConfig {
     uint8_t target = STREAM_TARGET_BIRDNET_GO;
 };
@@ -242,6 +235,16 @@ static const char* micFormatName(uint8_t format) {
     if (format == MIC_FORMAT_PDM) return "PDM";
     return format == MIC_FORMAT_MSB ? "SPH0645/MSB" : "ICS43434/Philips";
 }
+
+// Keep these after struct ClientSession: Arduino inserts auto-generated
+// prototypes above the first function definition in the sketch, and the
+// RTSP prototypes need ClientSession to be declared by then.
+static bool micFormatSupported(uint8_t format) {
+    if (format == MIC_FORMAT_PHILIPS || format == MIC_FORMAT_MSB) return true;
+    return format == MIC_FORMAT_PDM && PDM_MIC_SUPPORTED;
+}
+
+bool pdmMicSupported() { return PDM_MIC_SUPPORTED; }
 
 ClientSession clients[MAX_CLIENTS];
 StreamProfileConfig streamProfiles[2] = {
