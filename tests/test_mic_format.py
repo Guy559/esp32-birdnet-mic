@@ -6,6 +6,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKETCH = (ROOT / "esp32-birdnet-mic" / "esp32-birdnet-mic.ino").read_text(encoding="utf-8")
 WEBUI_CPP = (ROOT / "esp32-birdnet-mic" / "WebUI.cpp").read_text(encoding="utf-8")
 WEBUI_HTML = (ROOT / "esp32-birdnet-mic" / "webui" / "index.html").read_text(encoding="utf-8")
+README = (ROOT / "esp32-birdnet-mic" / "README.md").read_text(encoding="utf-8")
 
 
 class MicFormatContractTest(unittest.TestCase):
@@ -45,6 +46,13 @@ class MicFormatContractTest(unittest.TestCase):
         self.assertIn("bytesRead / bytesPerSample", SKETCH)
         self.assertIn("id='opt_mic_pdm'", WEBUI_HTML)
         self.assertIn("j.pdm_supported!==true", WEBUI_HTML)
+        # PDM mode locks rate/shift controls and drops shift advice.
+        self.assertIn("function applyMicMode(j)", WEBUI_HTML)
+        self.assertIn("then(j=>{ applyMicMode(j);", WEBUI_HTML)
+        self.assertIn("lock(['in_rate','btn_rate_set']", WEBUI_HTML)
+        self.assertIn("lock(['in_shift','btn_shift_set']", WEBUI_HTML)
+        self.assertIn("clip_bad:'CLIPPING! Reduce Gain.'", WEBUI_HTML)
+        self.assertIn("### PDM Microphones (XIAO ESP32-S3 only)", README)
 
 
 if __name__ == "__main__":

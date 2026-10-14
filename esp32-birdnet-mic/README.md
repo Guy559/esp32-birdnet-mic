@@ -244,6 +244,7 @@ format:
   **Audio -> Microphone format** or set
   API key `mic_format` to `1`.
 - **ICS-43434 / INMP441 (legacy):** standard Philips I2S; firmware default.
+- **PDM MEMS (ESP32-S3 only):** see [PDM Microphones](#pdm-microphones-xiao-esp32-s3-only).
 
 SPH0645 support was tested on contributor hardware. ICS-43434 and INMP441 remain supported for
 existing builds.
@@ -255,6 +256,32 @@ Firmware v1.21 outputs MCLK at 256 times the configured sample rate. This allows
 PCM1808 ADC hardware to run in slave I2S mode with its left input captured by the existing mono
 pipeline. The PCM1808 signal level, I2S Shift, analog gain, and noise performance still require
 validation on the complete microphone hardware before it is considered a tested reference setup.
+
+### PDM Microphones (XIAO ESP32-S3 only)
+
+PDM MEMS microphones such as the Infineon **IM73D122** are supported on the **XIAO ESP32-S3**,
+using the chip's hardware PDM-to-PCM filter. Select **Audio -> Microphone format -> PDM MEMS**
+or set API key `mic_format` to `2`. The option is hidden on C3, C5 and C6 builds, which lack the
+hardware filter.
+
+| Mic signal | XIAO pin label | S3 GPIO | Notes |
+|---:|:--:|:--:|---|
+| **CLK** | **D3** | 4 | Same pin as I2S BCLK; firmware outputs the PDM clock |
+| **DATA** | **D2** | 3 | Same pin as I2S SD |
+| **SELECT / L/R** | GND | - | Left slot. Tie high only if you also change the slot in code |
+| **VDD** | 3V3 | - | Feed through 10-47 ohm with 10 uF to GND at the mic to filter Wi-Fi ripple |
+| **GND** | GND | - | |
+
+WS (D1) and MCLK (D7) are unused in PDM mode. Remove any I2S microphone from D2/D3 first.
+
+- The sample rate is fixed at **48000 Hz** (3.072 MHz PDM clock, the IM73D122 high-performance
+  mode); other rates are rejected.
+- The hardware filter outputs **16-bit** samples, so **I2S Shift is ignored**. Gain is applied
+  after conversion and only sets level; it does not change SNR. Start around **4** and adjust so
+  typical calls peak well below clipping.
+- If audio is silent or pure noise, the microphone is driving the other slot: check SELECT.
+- In Safari, BirdNET-Go's live spectrogram can stay blank while audio plays (a WebKit limitation
+  with Web Audio on native HLS); use Firefox or Chrome for the live view.
 
 ### XIAO Antenna Paths
 
