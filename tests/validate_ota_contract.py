@@ -21,7 +21,9 @@ webui = WEBUI.read_text(encoding="utf-8")
 version_match = re.search(r'^\s*#define\s+FW_VERSION\s+"([^"]+)"', sketch, re.M)
 require(version_match, "FW_VERSION not found")
 version = version_match.group(1)
-require(re.fullmatch(r"[0-9]+\.[0-9]+", version), "FW_VERSION must use major.minor format")
+# Fork builds may append a "-tag" suffix; published files must match the base major.minor.
+require(re.fullmatch(r"[0-9]+\.[0-9]+(-[a-z0-9]+)?", version), "FW_VERSION must use major.minor[-tag] format")
+version = version.split("-", 1)[0]
 
 profiles = {
     "ARDUINO_XIAO_ESP32C3": "firmware-app-c3.bin",

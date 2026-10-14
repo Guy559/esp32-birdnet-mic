@@ -29,7 +29,10 @@
 #include "StreamHealth.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.26"
+// Fork build tag: the "-pdm1" suffix identifies this build on the OTA page and makes the
+// update check treat upstream releases as not comparable, so the UI never offers an
+// automatic update that would replace this fork with a build lacking PDM support.
+#define FW_VERSION "1.26-pdm1"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
